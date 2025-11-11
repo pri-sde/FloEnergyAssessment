@@ -17,6 +17,10 @@ public class Main {
                 int batchSize = 1000;
                 boolean skipNonNumeric = false;
                 boolean failNonNumeric = false;
+
+                // Validation & input handling
+                boolean strict = true;
+                boolean unwrapPdf = false;
                 char delimiter = ',';
                 Path output;
                 List<Path> inputs = new ArrayList<>();
@@ -59,33 +63,55 @@ public class Main {
                                                                         if (currentIntervalMins <= 0 || 1440 % currentIntervalMins != 0)
                                                                                 throw new RuntimeException("Bad interval minutes (must divide 1440): " + currentIntervalMins);
                                                                         break;
-                                                                case "300":
+                                                                case "300": {
                                                                         if (currentNmi == null || currentIntervalMins == null)
                                                                                 throw new RuntimeException("300 encountered before a valid 200 block");
-                                                                        String yyyymmdd = safeGet(row, 1);
+
+                                                                        int slots = 1440 / currentIntervalMins;
+                                                                        int need  = 2 + slots; // index 0: "300", index 1: yyyymmdd, then 'slots' values
+
+                                                                        // If you didn’t add --unwrap-pdf support, just keep: List<String> row300 = row;
+                                                                        List<String> row300 = cfg.unwrapPdf
+                                                                                ? unwrapPdfIfNeeded(line, br, cfg.delimiter, need)
+                                                                                : splitCsv(line, cfg.delimiter);
+
+                                                                        int available = Math.max(0, row300.size() - 2);
+                                                                        if (cfg.strict && available < slots) {
+                                                                                String dayProbe = row300.size() > 1 ? row300.get(1) : "?";
+                                                                                throw new RuntimeException(
+                                                                                        "Malformed 300 record for date " + dayProbe + ": expected " + slots +
+                                                                                                " values, found " + available + ". " +
+                                                                                                "If the source is PDF-copied, re-export CSV or use --unwrap-pdf."
+                                                                                );
+                                                                        }
+
+                                                                        String yyyymmdd = safeGet(row300, 1);
                                                                         if (yyyymmdd == null || yyyymmdd.length() != 8)
-                                                                                throw new RuntimeException("Invalid date in 300 record: " + row);
+                                                                                throw new RuntimeException("Invalid date in 300 record: " + row300);
+
                                                                         LocalDate day = LocalDate.of(
                                                                                 Integer.parseInt(yyyymmdd.substring(0, 4)),
                                                                                 Integer.parseInt(yyyymmdd.substring(4, 6)),
                                                                                 Integer.parseInt(yyyymmdd.substring(6, 8))
                                                                         );
-                                                                        int slots = 1440 / currentIntervalMins;
+
                                                                         for (int i = 0; i < slots; i++) {
-                                                                                String cell = safeGet(row, 2 + i);
+                                                                                String cell = safeGet(row300, 2 + i);
                                                                                 BigDecimal val;
                                                                                 if (cell == null || cell.trim().isEmpty()) {
                                                                                         if (cfg.skipNonNumeric) continue;
                                                                                         val = BigDecimal.ZERO;
                                                                                 } else {
-                                                                                        try { val = new BigDecimal(cell.trim()); }
-                                                                                        catch (NumberFormatException nfe) {
+                                                                                        try {
+                                                                                                val = new BigDecimal(cell.trim());
+                                                                                        } catch (NumberFormatException nfe) {
                                                                                                 if (cfg.failNonNumeric)
                                                                                                         throw new RuntimeException("Non-numeric interval '" + cell + "' (date " + yyyymmdd + ", slot " + i + ")", nfe);
                                                                                                 if (cfg.skipNonNumeric) continue;
                                                                                                 val = BigDecimal.ZERO;
                                                                                         }
                                                                                 }
+
                                                                                 LocalDateTime ts = day.atStartOfDay().plusMinutes((long) i * currentIntervalMins);
                                                                                 batch.add(new Row(currentNmi, ts, val));
                                                                                 if (batch.size() >= cfg.batchSize) {
@@ -94,6 +120,8 @@ public class Main {
                                                                                 }
                                                                         }
                                                                         break;
+                                                                }
+
                                                                 case "500":
                                                                         currentNmi = null;
                                                                         currentIntervalMins = null;
@@ -144,6 +172,11 @@ public class Main {
         private static String safeGet(List<String> row, int idx) {
                 return idx < row.size() ? row.get(idx) : null;
         }
+
+        // NOTE: Original PDF sample had wrapped decimals (e.g., "1.\n271").
+        //Input here was cleaned so each 300 record is single-line.
+       //If PDF input had to be parsed directly, an unwrap merge step
+       //would be needed before splitCsv()
         private static List<String> splitCsv(String line, char delimiter) {
                 List<String> out = new ArrayList<>();
                 StringBuilder cur = new StringBuilder();
@@ -174,6 +207,35 @@ public class Main {
                 out.add(cur.toString());
                 return out;
         }
+
+        // --- Unwrap helper (used only when --unwrap-pdf is set) ---
+        private static List<String> unwrapPdfIfNeeded(String firstLine, BufferedReader br, char delimiter, int need) throws IOException {
+                StringBuilder merged = new StringBuilder(firstLine);
+                List<String> row = splitCsv(merged.toString(), delimiter);
+                if (row.size() >= need) return row;
+
+                br.mark(1 << 16); // allow rollback (~64KB buffer)
+                String next;
+                while (row.size() < need && (next = br.readLine()) != null) {
+                        if (next.isEmpty()) { br.mark(1 << 16); continue; }
+                        String trimmed = next.trim();
+
+                        // stop if next line looks like a new NEM12 record
+                        if (trimmed.startsWith("100,") || trimmed.startsWith("200,") ||
+                                trimmed.startsWith("300,") || trimmed.startsWith("500,") ||
+                                trimmed.startsWith("900")) {
+                                br.reset();
+                                return row; // strict validation will handle missing values
+                        }
+
+                        // join lines like "1.\n271" -> "1.271"
+                        merged.append(next);
+                        row = splitCsv(merged.toString(), delimiter);
+                        br.mark(1 << 16);
+                }
+                return row;
+        }
+
         private static Config parseArgs(String[] args) {
                 if (args.length == 0) { printHelp(); return null; }
                 Config c = new Config();
@@ -204,6 +266,12 @@ public class Main {
                                 case "-o":
                                         requireArg(args, i, "-o");
                                         c.output = Paths.get(args[++i]);
+                                        break;
+                                case "--unwrap-pdf":
+                                        c.unwrapPdf = true;
+                                        break;
+                                case "--no-strict":
+                                        c.strict = false;
                                         break;
                                 default:
                                         if (a.startsWith("-")) {
